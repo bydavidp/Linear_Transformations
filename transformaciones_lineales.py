@@ -7,11 +7,15 @@ Uso: python transformaciones_lineales.py
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Sequence
+import io
+import tokenize
 
 import sympy as sp
+from sympy.calculus.util import continuous_domain
 
 x, y, z = sp.symbols('x y z', real=True)
-PARSE_GLOBALS = {'__builtins__': {}, 'Integer':sp.Integer, 'Float':sp.Float, 'Rational':sp.Rational, 'Symbol':sp.Symbol, 'factorial':sp.factorial}
+PARSE_GLOBALS = {'__builtins__': {}, 'Integer':sp.Integer, 'Float':sp.Float,
+                 'Rational':sp.Rational, 'Add':sp.Add, 'Mul':sp.Mul, 'Pow':sp.Pow}
 ALLOWED = {'x':x, 'y':y, 'z':z, 'sqrt':sp.sqrt, 'sin':sp.sin,
            'cos':sp.cos, 'pi':sp.pi, 'Abs':sp.Abs, 'exp':sp.exp,
            'log':sp.log, 'Rational':sp.Rational}
@@ -19,18 +23,24 @@ ALLOWED = {'x':x, 'y':y, 'z':z, 'sqrt':sp.sqrt, 'sin':sp.sin,
 
 def _split_top(s: str, sep=','):
     """Divide por 'sep' solo al nivel superior de paréntesis/brackets."""
-    bits, depth, cur = [], 0, ''
+    bits, stack, cur = [], [], ''
     for ch in s:
         if ch in '([':
-            depth += 1
+            stack.append(ch)
         elif ch in ')]':
-            depth -= 1
-        if ch == sep and depth == 0:
+            if not stack or stack.pop() != {')': '(', ']': '['}[ch]:
+                raise ValueError('Paréntesis desbalanceados.')
+        if ch == sep and not stack:
             bits.append(cur); cur = ''
         else:
             cur += ch
+    if stack:
+        raise ValueError('Paréntesis desbalanceados.')
     bits.append(cur)
-    return [b for b in (p.strip() for p in bits) if b]
+    parts = [p.strip() for p in bits]
+    if any(not part for part in parts):
+        raise ValueError('Falta una componente entre las comas.')
+    return parts
 
 
 def _strip_outer(s: str):
@@ -48,9 +58,41 @@ def _strip_outer(s: str):
     return s
 
 
-def parse_formula(formula: str, variables: Sequence[sp.Symbol]):
+def _parse_scalar(text, permitted):
+    """Analiza solo aritmética y nombres conocidos; no es un sandbox de recursos."""
+    from sympy.parsing.sympy_parser import (parse_expr, standard_transformations,
+        implicit_multiplication_application, convert_xor)
+    if len(text) > 500:
+        raise ValueError('La expresión es demasiado larga.')
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for tok in tokens:
+            if tok.type == tokenize.NAME and tok.string not in permitted:
+                raise ValueError('Nombre no permitido: ' + tok.string)
+            if tok.type == tokenize.NUMBER and (len(tok.string) > 20 or 'j' in tok.string.lower()):
+                raise ValueError('Número no permitido.')
+            if tok.type == tokenize.OP and tok.string not in ('+', '-', '*', '/', '**', '^', '(', ')', ','):
+                raise ValueError('Operador no permitido: ' + tok.string)
+            if tok.type not in (tokenize.NAME, tokenize.NUMBER, tokenize.OP,
+                                tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER):
+                raise ValueError('Entrada no permitida.')
+        result = parse_expr(text, local_dict=permitted, global_dict=PARSE_GLOBALS,
+                            transformations=standard_transformations+(implicit_multiplication_application, convert_xor),
+                            evaluate=False)
+        if not isinstance(result, sp.Expr):
+            raise ValueError('Se esperaba una expresión escalar.')
+        for node in sp.preorder_traversal(result):
+            if node.is_Pow and node.exp.is_number:
+                exponent = node.exp.evalf()
+                if exponent.is_real is not True or abs(exponent) > 1000:
+                    raise ValueError('Exponente numérico fuera del límite permitido.')
+        return result
+    except (SyntaxError, tokenize.TokenError, TypeError, NameError, AttributeError) as exc:
+        raise ValueError('Expresión inválida.') from exc
+
+
+def _formula_parts(formula, variables):
     """Convierte '2*x + y, 3*y' o '(2*x+y,3*y)' en vector simbólico."""
-    from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
     s = formula.strip()
     if s.startswith('T(') and '=' in s:
         s = s.split('=',1)[1].strip()
@@ -61,13 +103,18 @@ def parse_formula(formula: str, variables: Sequence[sp.Symbol]):
     permitted = {k:v for k,v in ALLOWED.items() if k not in ('x','y','z') or v in variables}
     parsed = []
     for part in parts:
-        expr = parse_expr(part, local_dict=permitted, global_dict=PARSE_GLOBALS,
-                          transformations=standard_transformations+(implicit_multiplication_application,convert_xor),
-                          evaluate=True)
+        expr = _parse_scalar(part, permitted)
         if expr.free_symbols - set(variables):
             raise ValueError('Usa solamente las variables ' + ', '.join(map(str,variables)))
-        parsed.append(sp.simplify(expr))
-    return sp.Matrix(parsed)
+        if not expr.free_symbols and (expr.is_real is not True or expr.is_finite is not True):
+            raise ValueError('Las componentes constantes deben ser números reales finitos.')
+        parsed.append(expr)
+    return parsed
+
+
+def parse_formula(formula: str, variables: Sequence[sp.Symbol]):
+    """Convierte componentes en un vector simbólico simplificado."""
+    return sp.Matrix([sp.simplify(e) for e in _formula_parts(formula, variables)])
 
 
 def analyze(formula: str, dimension: int):
@@ -75,15 +122,26 @@ def analyze(formula: str, dimension: int):
     if dimension not in (2,3):
         raise ValueError('La entrada debe ser R² o R³.')
     vars_ = (x,y,z)[:dimension]
-    expr = parse_formula(formula, vars_)
+    original = _formula_parts(formula, vars_)
+    # Comprobar antes de simplificar: x/x pierde el agujero en x=0.
+    total = True
+    for component in original:
+        for var in vars_:
+            try:
+                if continuous_domain(component, var, sp.S.Reals) != sp.S.Reals:
+                    total = False
+            except (NotImplementedError, ValueError, TypeError):
+                total = False
+    expr = sp.Matrix(original)
     zero = sp.simplify(expr.subs({v:0 for v in vars_}))
     jac = expr.jacobian(vars_)
     # Teorema: T es lineal <=> T(0)=0 y toda derivada parcial de toda componente es constante.
     # (El método anterior con jac*v fallaba con casos como Abs(x), que sympy simplifica a lo mismo.)
     const_partials = all(sp.simplify(c).free_symbols == set() for row in jac.tolist() for c in row)
-    linear = bool(const_partials) and all(t == 0 for t in zero)
+    linear = total and bool(const_partials) and all(t == 0 for t in zero) and all(
+        c.is_real is True and c.is_finite is True for c in jac)
     return {'vars':vars_, 'expr':expr, 'matrix':jac if linear else None,
-            'jacobian':jac,'zero':zero,'linear':linear}
+            'jacobian':jac,'zero':zero,'linear':linear, 'total':total}
 
 
 def parse_vector(raw: str, n: int):
@@ -91,19 +149,31 @@ def parse_vector(raw: str, n: int):
     bits = _split_top(raw)
     if len(bits)!=n:
         raise ValueError(f'Escribe {n} coordenadas separadas por comas.')
-    from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
     values=[]
     for b in bits:
-        e = parse_expr(b,local_dict={'sqrt':sp.sqrt,'pi':sp.pi},global_dict=PARSE_GLOBALS,
-                       transformations=standard_transformations+(implicit_multiplication_application,))
+        e = _parse_scalar(b, {k:v for k,v in ALLOWED.items() if k not in ('x','y','z')})
         if e.free_symbols:
             raise ValueError('Las coordenadas deben ser números, no variables.')
-        values.append(sp.simplify(e))
+        e = sp.simplify(e)
+        if e.is_real is not True or e.is_finite is not True:
+            raise ValueError('Las coordenadas deben ser números reales finitos.')
+        values.append(e)
     return sp.Matrix(values)
 
 
 def apply(expr, vars_, vector):
-    return sp.Matrix([sp.simplify(e.subs(dict(zip(vars_,vector)))) for e in expr])
+    if len(vars_) != len(vector):
+        raise ValueError('La dimensión del vector no coincide con la entrada.')
+    substitutions = dict(zip(vars_, vector))
+    for e in expr:
+        for node in sp.preorder_traversal(e):
+            if node.is_Pow and node.exp.is_negative is True:
+                if sp.simplify(node.base.subs(substitutions, simultaneous=True)) == 0:
+                    raise ValueError('La transformación no está definida en este vector.')
+    result = [sp.simplify(e.subs(substitutions, simultaneous=True)) for e in expr]
+    if any(e.is_real is not True or e.is_finite is not True for e in result):
+        raise ValueError('La transformación no produce valores reales finitos en este vector.')
+    return sp.Matrix(result)
 
 
 def format_vec(vec):
@@ -127,6 +197,8 @@ PRESETS = {
     'R² a R³ (x, y, x+y)': ('x, y, x+y',2),
 }
 
+CREDITOS = 'Creado por Jose David Palacios\nEstudiante de Ingeniería en Sistemas — Univalle'
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -142,6 +214,9 @@ class App(tk.Tk):
         self.preset=tk.StringVar(value='Escalamiento (2x, 3y)')
         self.plot_mode=tk.BooleanVar(value=True)
         self._make_ui()
+        self.last_report=None
+        for variable in (self.formula,self.dim,self.vector,self.figure):
+            variable.trace_add('write',self.invalidate_results)
         self.solve()
 
     def _make_ui(self):
@@ -153,8 +228,10 @@ class App(tk.Tk):
         style.configure('Header.TLabel',font=('Arial',16,'bold'),foreground='#14223b',background='#f2f5f9')
         top=ttk.Frame(self,padding=16)
         top.pack(fill='x')
+        ttk.Button(top,text='Acerca de',command=self.mostrar_acerca_de).pack(side='right',anchor='n')
         ttk.Label(top,text='Transformaciones lineales • Laboratorio de Álgebra',style='Header.TLabel').pack(anchor='w')
         ttk.Label(top,text='Analiza T: Rⁿ → Rᵐ, evalúa vectores y representa figuras en R².').pack(anchor='w',pady=(5,0))
+        ttk.Label(top,text=CREDITOS,justify='left').pack(anchor='w',pady=(5,0))
         controls=ttk.Frame(self,padding=(16,2,16,10))
         controls.pack(fill='x')
         ttk.Label(controls,text='Ejemplos:').grid(row=0,column=0,sticky='w',pady=5)
@@ -162,7 +239,7 @@ class App(tk.Tk):
         box.grid(row=0,column=1,columnspan=2,sticky='ew',padx=7)
         box.bind('<<ComboboxSelected>>', self.load_preset)
         ttk.Label(controls,text='Dimensión de entrada:').grid(row=0,column=3,sticky='e',padx=7)
-        dimbox=ttk.Combobox(controls,textvariable=self.dim,values=(2,3),state='readonly',width=4)
+        dimbox=ttk.Combobox(controls,textvariable=self.dim,values=('2','3'),state='readonly',width=4)
         dimbox.grid(row=0,column=4,sticky='w')
         dimbox.bind('<<ComboboxSelected>>', self.on_dim_change)
         ttk.Label(controls,text='T(x,y) o T(x,y,z) =').grid(row=1,column=0,sticky='w',pady=8)
@@ -190,6 +267,9 @@ class App(tk.Tk):
         self.graph_frame=graph
         self.canvas=None
 
+    def mostrar_acerca_de(self):
+        messagebox.showinfo('Acerca de', CREDITOS, parent=self)
+
     def on_dim_change(self, event=None):
         self.vector.set('2, 3, 5' if self.dim.get()==3 else '2, 3')
         self.solve()
@@ -200,7 +280,15 @@ class App(tk.Tk):
         self.vector.set('2, 3, 5' if self.dim.get()==3 else '2, 3')
         self.solve()
 
+    def invalidate_results(self, *args):
+        self.last_report=None
+        self.output.delete('1.0','end')
+        for child in self.graph_frame.winfo_children():
+            child.destroy()
+        self.canvas=None
+
     def solve(self):
+        self.invalidate_results()
         try:
             n=self.dim.get()
             info=analyze(self.formula.get(),n)
@@ -223,35 +311,48 @@ class App(tk.Tk):
                     rows.append('   [ ' + '  '.join(str(c) for c in info['matrix'].row(i)) + ' ]')
                 rows.append('   Por ello se cumplen aditividad y homogeneidad para TODOS los vectores.')
             else:
-                rows.append('   RESULTADO: NO ES LINEAL ✗')
-                if any(v!=0 for v in info['zero']):
+                if not info['total']:
+                    rows.append('   RESULTADO: NO SE PUDO DETERMINAR LA LINEALIDAD EN TODO Rⁿ.')
+                    rows.append('   No se ha podido establecer que la fórmula esté definida y sea continua en todo Rⁿ.')
+                elif any(v!=0 for v in info['zero']):
+                    rows.append('   RESULTADO: NO ES LINEAL ✗')
                     rows.append('   Contraejemplo: T(0) ≠ 0, requisito necesario de linealidad.')
                 else:
+                    rows.append('   RESULTADO: NO ES LINEAL ✗')
                     rows.append('   Existe al menos una derivada parcial no constante,')
                     rows.append('   así que T no puede escribirse como A·v con A constante.')
                     rows.append('   Esto impide que ambas propiedades se cumplan para todos los vectores.')
             rows.append('\n3. EVALUACIÓN DEL VECTOR')
             rows.append('   v = ' + format_vec(vec))
             rows.append('   T(v) = '+format_vec(transformed))
-            rows.append('   Sustitución: ' + ', '.join(f'{var}={val}' for var,val in zip(info['vars'],vec)))
+            rows.append('   Sustitución: ' + ', '.join(f'{var}={vec[i]}' for i,var in enumerate(info['vars'])))
             rows.append('\n4. TRANSFORMACIÓN DE LA FIGURA')
             vertices=None
             if n==2:
-                vertices=[parse_vector(s.strip(),2) for s in self.figure.get().split(';') if s.strip()]
-                if not vertices: raise ValueError('Indica al menos un vértice.')
-                for i,p in enumerate(vertices):
-                    t=apply(info['expr'],info['vars'],p)
-                    rows.append(f'   {chr(65+i%26)}: {format_vec(p)} → {format_vec(t)}')
-                if len(info['expr'])!=2:
-                    rows.append('   Gráfica no disponible: la salida no es R².')
+                try:
+                    vertices=[parse_vector(s.strip(),2) for s in self.figure.get().split(';') if s.strip()]
+                    if vertices:
+                        figure_rows=[]
+                        for i,p in enumerate(vertices):
+                            t=apply(info['expr'],info['vars'],p)
+                            figure_rows.append(f'   {chr(65+i%26)}: {format_vec(p)} → {format_vec(t)}')
+                        rows.extend(figure_rows)
+                        if len(info['expr'])!=2:
+                            rows.append('   Gráfica no disponible: la salida no es R².')
+                    else:
+                        rows.append('   No se indicó ninguna figura.')
+                except Exception as e:
+                    vertices=None
+                    rows.append('   No se pudo procesar la figura: ' + str(e))
             else:
                 rows.append('   Para graficar figuras, selecciona entrada R² y salida R².')
             self.last_report='\n'.join(rows)
             self.output.delete('1.0','end')
             self.output.insert('1.0',self.last_report)
-            self.draw(info,vertices)
         except Exception as e:
             messagebox.showerror('Revisa los datos',str(e))
+            return
+        self.draw(info,vertices)
 
     def draw(self,info,vertices):
         for child in self.graph_frame.winfo_children():child.destroy()
@@ -269,9 +370,19 @@ class App(tk.Tk):
             targ=[(float(sp.N(p[0])),float(sp.N(p[1]))) for p in dest]
             if len(vertices)>=3:
                 orig=orig+[orig[0]]
-                targ=targ+[targ[0]]
             ax.plot(*zip(*orig),'-o',color='#64748b',label='Original')
-            ax.plot(*zip(*targ),'-o',color='#0d9488',label='Transformada')
+            if len(vertices)>1:
+                samples=[]
+                for a,b in zip(orig,orig[1:]):
+                    for i in range(51):
+                        t=i/50
+                        point=[a[j]*(1-t)+b[j]*t for j in range(2)]
+                        image=apply(info['expr'],info['vars'],point)
+                        samples.append(tuple(float(sp.N(v)) for v in image))
+                ax.plot(*zip(*samples),'-',color='#0d9488',label='Transformada')
+                ax.plot(*zip(*targ),'o',color='#0d9488')
+            else:
+                ax.plot(*zip(*targ),'o',color='#0d9488',label='Transformada')
             for i,(a,b) in enumerate(targ[:len(vertices)]):
                 ax.annotate(chr(65+i%26)+"'",(a,b),xytext=(5,6),textcoords='offset points',color='#087b72')
             ax.axhline(0,color='#555',linewidth=.8)
@@ -293,10 +404,15 @@ class App(tk.Tk):
             ttk.Label(self.graph_frame,text='No se pudo dibujar:\n'+str(e),padding=18).pack()
 
     def save_text(self):
-        if not getattr(self,'last_report',None): return
+        report = self.last_report
+        if not report: return
         file=filedialog.asksaveasfilename(defaultextension='.txt',filetypes=[('Archivo de texto','*.txt')],initialfile='solucion_transformacion.txt')
         if file:
-            with open(file,'w',encoding='utf8') as f:f.write(self.last_report)
+            try:
+                with open(file,'w',encoding='utf8') as f:f.write(report)
+            except (OSError, UnicodeError) as e:
+                messagebox.showerror('Error al guardar',str(e))
+                return
             messagebox.showinfo('Archivo guardado',f'Se guardó la explicación en:\n{file}')
 
 
