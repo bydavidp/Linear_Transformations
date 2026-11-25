@@ -84,6 +84,15 @@ py -m venv .venv-windows
 
 Abre `dist\LaboratorioTransformaciones\LaboratorioTransformaciones.exe`. Para distribuirlo, comprime y entrega la carpeta `dist\LaboratorioTransformaciones` completa. Prueba el resultado en Windows antes de distribuirlo.
 
+También puedes generar la versión Windows mediante GitHub Actions sin tener Windows instalado:
+
+1. En GitHub abre la pestaña **Actions** del repositorio y selecciona **Compilar aplicación para Windows**.
+2. Selecciona **Run workflow** y ejecuta el flujo en la rama deseada. También se ejecuta automáticamente con cada push a `main`.
+3. Cuando termine correctamente, abre la ejecución y descarga el artefacto **LaboratorioTransformaciones-Windows**.
+4. Descomprime el archivo descargado y ejecuta `LaboratorioTransformaciones.exe`. Conserva el resto de archivos y carpetas junto al ejecutable.
+
+El artefacto de Actions tiene un periodo de retención limitado y no sustituye una publicación permanente en Releases. Prueba el ejecutable en Windows antes de distribuirlo.
+
 PyInstaller también crea `build/` y un archivo `.spec`; son productos de compilación y se pueden borrar junto con `dist/` para deshacer el empaquetado. Los entornos `.venv` y `.venv-windows` también se pueden eliminar si ya no se necesitan.
 
 ## Créditos

@@ -1,0 +1,37 @@
+name: Compilar aplicación para Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Ejecutar pruebas
+        run: python -m unittest discover -s tests -v
+
+      - name: Generar aplicación
+        run: python -m PyInstaller --noconfirm --clean --windowed --onedir --name LaboratorioTransformaciones transformaciones_lineales.py
+
+      - name: Publicar carpeta de la aplicación
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaboratorioTransformaciones-Windows
+          path: dist/LaboratorioTransformaciones/
+          if-no-files-found: error
